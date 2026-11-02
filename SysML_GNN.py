@@ -17,12 +17,16 @@ from sklearn.metrics.pairwise import cosine_similarity
 import itertools
 import copy
 
-# === Step 1: Parse XML ===
-tree = ET.parse("sysml_graph.xml")
-root = tree.getroot()
+# === Step 1: Load teammate's normalized Inventory graph ===
+G = nx.read_graphml("inventory_handoff.graphml")
 
-G = nx.DiGraph()
-
+print(
+    "✅ Loaded Inventory handoff graph:",
+    G.number_of_nodes(),
+    "nodes,",
+    G.number_of_edges(),
+    "edges"
+)
 # === Step 2: Load MiniLM ===
 tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
 model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
@@ -33,51 +37,52 @@ def get_embedding(text):
         with torch.no_grad():
             outputs = model(**inputs)
         return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
-    except Exception:
-        return np.zeros(384)
+    except Exception as e:
+        print(f"⚠️ MiniLM embedding failed for text: {text[:80]!r}")
+        print(f"   Error: {e}")
+        raise 
 
-# === Step 3: Parse Nodes and Build type_map ===
-type_set = set()
-for node in root.findall(".//node"):
-    t = node.attrib.get("type")
-    if t:
-        type_set.add(t)
-# Ensure 'Generic' is always present
-type_set.add('Generic')
+
+# === Step 3: Build GNN features and labels from teammate's graph ===
+
+type_set = {
+    str(G.nodes[n].get("type", "Generic") or "Generic")
+    for n in G.nodes
+}
+
+type_set.add("Generic")
+
 type_map = {t: i for i, t in enumerate(sorted(type_set))}
 rev_type_map = {v: k for k, v in type_map.items()}
 
-for node in root.findall(".//node"):
-    nid = node.attrib.get("id")
-    name = node.attrib.get("name", "").strip()
+for nid, data in G.nodes(data=True):
+    name = str(data.get("name", "") or "").strip()
+
     if not name:
         name = "Unnamed"
 
-    t = node.attrib.get("type", "Generic")
-    doc = node.attrib.get("documentation", "")
-    text = f"{name} {doc}".strip()
+    node_type = str(data.get("type", "Generic") or "Generic")
+    documentation = str(data.get("documentation", "") or "")
 
-    emb = get_embedding(text)
-    label = type_map.get(t, type_map["Generic"])
+    text = f"{name} {documentation}".strip()
+    embedding = get_embedding(text)
 
-    G.add_node(nid,
-               name=name,
-               type=t,
-               documentation=doc,
-               x=emb.tolist(),
-               y=label,
-               label=name)  # Set label for PyVis and other graph use
+    data["name"] = name
+    data["type"] = node_type
+    data["documentation"] = documentation
+    data["x"] = embedding.tolist()
+    data["y"] = type_map.get(node_type, type_map["Generic"])
+    data["label"] = name
 
-# === Step 4: Parse Edges ===
-for edge in root.findall(".//edge"):
-    source = edge.attrib.get("source")
-    target = edge.attrib.get("target")
-    relation = edge.attrib.get("type", "relatedTo")
-    if source in G.nodes and target in G.nodes:
-        G.add_edge(source, target, relation=relation)
 
-print("✅ Parsed Nodes:", len(G.nodes))
-print("✅ Parsed Edges:", len(G.edges))
+# === Step 4: Graph structure already loaded from GraphML ===
+
+print("✅ Parsed Nodes:", G.number_of_nodes())
+print("✅ Parsed Edges:", G.number_of_edges())
+
+
+
+
 
 # Copy 'name' into 'label' for each node
 for node, data in G.nodes(data=True):
@@ -151,6 +156,61 @@ for edge in net.edges:
 
 net.write_html("sysml_model_graph_interactive.html")
 
+
+# === EX04 Person 2: Graph Validation and Analysis ===
+def analyze_graph(G):
+    print("\n=== GRAPH ANALYSIS ===")
+
+    # Basic graph statistics
+    total_nodes = G.number_of_nodes()
+    total_edges = G.number_of_edges()
+
+    print("Total nodes:", total_nodes)
+    print("Total edges:", total_edges)
+
+    # Find orphan / isolated nodes
+    isolated_nodes = list(nx.isolates(G))
+    print("Orphan nodes:", len(isolated_nodes))
+
+    for node in isolated_nodes:
+        print("  -", G.nodes[node].get("name", node))
+
+    # Find cycles in the directed graph
+    cycles = list(nx.simple_cycles(G))
+    print("Cycles found:", len(cycles))
+
+    for cycle in cycles[:10]:
+        print("  -", cycle)
+
+    # Find most connected nodes
+    degree_list = sorted(
+        G.degree(),
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    print("\nMost connected nodes:")
+    for node, degree in degree_list[:10]:
+        name = G.nodes[node].get("name", node)
+        node_type = G.nodes[node].get("type", "Unknown")
+        print(f"  {name} ({node_type}): degree {degree}")
+
+    # Save summary for the EX04 report
+    analysis_df = pd.DataFrame([{
+        "total_nodes": total_nodes,
+        "total_edges": total_edges,
+        "orphan_nodes": len(isolated_nodes),
+        "cycles": len(cycles)
+    }])
+
+    analysis_df.to_csv("graph_analysis.csv", index=False)
+
+    return isolated_nodes, cycles
+
+
+isolated_nodes, cycles = analyze_graph(G)
+
+
 # === Step 6: GNN with PyTorch Geometric ===
 data = from_networkx(G)
 data.x = torch.tensor([G.nodes[n]['x'] for n in G.nodes], dtype=torch.float)
@@ -182,8 +242,8 @@ with torch.no_grad():
     h = F.relu(W1(data.x, data.edge_index))
     logits = W2(h, data.edge_index)
     preds = torch.argmax(logits, dim=1).numpy()
-    embeddings = logits.numpy()
-
+    embeddings = h.numpy() 
+    
 # === Step 8: Save Embeddings ===
 labels = [G.nodes[n]['name'] for n in G.nodes]
 types = [rev_type_map[y] for y in data.y.numpy()]
@@ -193,8 +253,9 @@ df.to_csv("sysml_node_embeddings.csv")
 
 # === Step 9: Visualize with t-SNE and PCA ===
 if embeddings.shape[0] > 2 and embeddings.shape[1] > 2:
-    tsne_result = TSNE(n_components=2, perplexity=30).fit_transform(embeddings)
-    pca_result = PCA(n_components=2).fit_transform(embeddings)
+    perplexity = min(30, embeddings.shape[0] - 1)
+    tsne_result = TSNE(n_components=2, perplexity=perplexity, random_state=42).fit_transform(embeddings) 
+    pca_result = PCA(n_components=2).fit_transform(embeddings) 
 
     tsne_df = pd.DataFrame({'x': tsne_result[:,0], 'y': tsne_result[:,1], 'label': types, 'node': labels})
     pca_df = pd.DataFrame({'x': pca_result[:,0], 'y': pca_result[:,1], 'label': types, 'node': labels})
@@ -204,20 +265,51 @@ if embeddings.shape[0] > 2 and embeddings.shape[1] > 2:
 else:
     print("⚠️ Not enough samples/features for t-SNE or PCA")
 
-# === Step 10: Link Prediction via Cosine Similarity ===
+# === Step 10: Exploratory Link Prediction via Cosine Similarity ===
 similarity_matrix = cosine_similarity(embeddings)
 threshold = 0.95
 existing_edges = set(G.edges())
 predicted_edges = []
 node_list = list(G.nodes)
-for i, j in itertools.combinations(range(len(node_list)), 2):
-    if (node_list[i], node_list[j]) not in existing_edges:
-        sim = similarity_matrix[i, j]
-        if sim > threshold:
-            predicted_edges.append((node_list[i], node_list[j], sim))
 
-link_df = pd.DataFrame(predicted_edges, columns=["source", "target", "similarity"])
+for i, j in itertools.combinations(range(len(node_list)), 2):
+    source = node_list[i]
+    target = node_list[j]
+
+    # This is a directed graph. Do not suggest a candidate pair if a
+    # relationship already exists in either direction.
+    forward_exists = (source, target) in existing_edges
+    reverse_exists = (target, source) in existing_edges
+
+    if forward_exists or reverse_exists:
+        continue
+
+    sim = similarity_matrix[i, j]
+
+    if sim > threshold:
+        predicted_edges.append((source, target, sim))
+
+link_df = pd.DataFrame(
+    predicted_edges,
+    columns=["source", "target", "similarity"]
+)
 link_df.to_csv("predicted_links.csv", index=False)
+
+print("\n=== EXPLORATORY LINK PREDICTION RESULTS ===")
+print("Candidate relationships for review:", len(predicted_edges))
+print(
+    "Note: These candidates are exploratory findings and are not "
+    "confirmed missing requirement relationships."
+)
+
+for source, target, similarity in predicted_edges[:10]:
+    source_name = G.nodes[source].get("name", source)
+    target_name = G.nodes[target].get("name", target)
+
+    print(
+        f"  {source_name} <-> {target_name} "
+        f"(similarity: {similarity:.3f})"
+    )
 
 print("✅ Script completed.")
 
