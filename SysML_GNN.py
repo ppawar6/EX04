@@ -37,8 +37,10 @@ def get_embedding(text):
         with torch.no_grad():
             outputs = model(**inputs)
         return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
-    except Exception:
-        return np.zeros(384)
+    except Exception as e:
+        print(f"⚠️ MiniLM embedding failed for text: {text[:80]!r}")
+        print(f"   Error: {e}")
+        raise 
 
 
 # === Step 3: Build GNN features and labels from teammate's graph ===
@@ -263,30 +265,49 @@ if embeddings.shape[0] > 2 and embeddings.shape[1] > 2:
 else:
     print("⚠️ Not enough samples/features for t-SNE or PCA")
 
-# === Step 10: Link Prediction via Cosine Similarity ===
+# === Step 10: Exploratory Link Prediction via Cosine Similarity ===
 similarity_matrix = cosine_similarity(embeddings)
 threshold = 0.95
 existing_edges = set(G.edges())
 predicted_edges = []
 node_list = list(G.nodes)
-for i, j in itertools.combinations(range(len(node_list)), 2):
-    if (node_list[i], node_list[j]) not in existing_edges:
-        sim = similarity_matrix[i, j]
-        if sim > threshold:
-            predicted_edges.append((node_list[i], node_list[j], sim))
 
-link_df = pd.DataFrame(predicted_edges, columns=["source", "target", "similarity"])
+for i, j in itertools.combinations(range(len(node_list)), 2):
+    source = node_list[i]
+    target = node_list[j]
+
+    # This is a directed graph. Do not suggest a candidate pair if a
+    # relationship already exists in either direction.
+    forward_exists = (source, target) in existing_edges
+    reverse_exists = (target, source) in existing_edges
+
+    if forward_exists or reverse_exists:
+        continue
+
+    sim = similarity_matrix[i, j]
+
+    if sim > threshold:
+        predicted_edges.append((source, target, sim))
+
+link_df = pd.DataFrame(
+    predicted_edges,
+    columns=["source", "target", "similarity"]
+)
 link_df.to_csv("predicted_links.csv", index=False)
 
-print("\n=== LINK PREDICTION RESULTS ===")
-print("Potential missing relationships:", len(predicted_edges))
+print("\n=== EXPLORATORY LINK PREDICTION RESULTS ===")
+print("Candidate relationships for review:", len(predicted_edges))
+print(
+    "Note: These candidates are exploratory findings and are not "
+    "confirmed missing requirement relationships."
+)
 
 for source, target, similarity in predicted_edges[:10]:
     source_name = G.nodes[source].get("name", source)
     target_name = G.nodes[target].get("name", target)
 
     print(
-        f"  {source_name} -> {target_name} "
+        f"  {source_name} <-> {target_name} "
         f"(similarity: {similarity:.3f})"
     )
 
